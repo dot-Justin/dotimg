@@ -108,30 +108,55 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
 
     # ── Auto-crop algorithm ───────────────────────────────────────────────────
 
-    def _smart_crop_bbox(pil_img, alpha_threshold=15, min_island_frac=0.0005,
-                         min_island_abs=50, soft_threshold=2, margin=4,
-                         expand_limit=120):
+    def _smart_crop_bbox(pil_img, alpha_threshold=15, bg_tolerance=28,
+                         min_island_frac=0.0005, min_island_abs=50,
+                         soft_threshold=2, soft_bg_threshold=8,
+                         margin=4, expand_limit=120):
         """
-        Compute a tight crop box that:
-        - Ignores isolated "island" pixels / small near-transparent blobs
-        - Preserves feathered/soft edges connected to the main subject
-        - Adds a small safety margin
+        Smart auto-crop for both alpha and non-alpha images.
 
-        Returns (x1, y1, x2, y2) in image coordinates, or None.
+        Alpha images:    uses transparency as the content signal.
+        Non-alpha images: samples background color from corners, uses
+                          per-pixel Euclidean RGB distance as the signal.
+
+        In both cases:
+        - Island filter: removes small isolated blobs (connected components
+          below a size threshold), preserving feathered/soft edges (which are
+          spatially connected to the main subject).
+        - Soft-edge expansion: after finding the content bbox, expands outward
+          until the signal drops near-zero, capturing full anti-aliasing /
+          feather without being misled by distant stray pixels.
+        - Safety margin added last.
+
+        Returns (x1, y1, x2, y2) or None.
         """
         import numpy as np
 
-        rgba = pil_img.convert("RGBA")
-        alpha = np.array(rgba, dtype=np.uint8)[:, :, 3]
-        h, w = alpha.shape
+        has_alpha = (pil_img.mode in ("RGBA", "LA", "PA")
+                     or "transparency" in pil_img.info)
 
-        # Minimum island size: 0.05% of image area, at least 50 px
+        if has_alpha:
+            arr = np.array(pil_img.convert("RGBA"), dtype=np.uint8)[:, :, 3]
+            h, w = arr.shape
+            signal = arr.astype(np.float32)   # 0–255, higher = more foreground
+            mask = arr > alpha_threshold
+            eff_soft = soft_threshold
+            mode_label = "alpha"
+        else:
+            rgb = np.array(pil_img.convert("RGB"), dtype=np.float32)
+            h, w = rgb.shape[:2]
+            # Background: median of the four corners
+            corners = np.array([rgb[0, 0], rgb[0, w-1], rgb[h-1, 0], rgb[h-1, w-1]])
+            bg = np.median(corners, axis=0)
+            signal = np.sqrt(((rgb - bg) ** 2).sum(axis=2))  # distance from bg
+            mask = signal > bg_tolerance
+            eff_soft = soft_bg_threshold
+            mode_label = f"bg #{int(bg[0]):02x}{int(bg[1]):02x}{int(bg[2]):02x}"
+
         min_island_px = max(min_island_abs, int(h * w * min_island_frac))
 
-        # --- Step 1: binary mask of "significant" pixels --------------------
-        mask = alpha > alpha_threshold
         if not mask.any():
-            return None  # fully transparent
+            return None
 
         # --- Step 2: remove isolated islands via connected components --------
         try:
@@ -140,11 +165,9 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
             if n == 0:
                 return None
             sizes = np.bincount(labeled.ravel())
-            sizes[0] = 0  # background
+            sizes[0] = 0
             mask_clean = (sizes >= min_island_px)[labeled]
         except ImportError:
-            # Numpy-only fallback: morphological open (erode then dilate)
-            # removes blobs smaller than the structuring element
             import math
             radius = max(2, int(math.sqrt(min_island_px / math.pi) * 0.7))
             eroded = mask.copy()
@@ -172,27 +195,24 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
                 mask_clean = dilated & mask
 
         if not mask_clean.any():
-            mask_clean = mask  # nothing survived → don't over-crop
+            mask_clean = mask
 
         # --- Step 3: tight bbox of remaining content ------------------------
         rows = np.where(mask_clean.any(axis=1))[0]
         cols = np.where(mask_clean.any(axis=0))[0]
-        ry1, ry2 = int(rows[0]), int(rows[-1]) + 1   # ry2 exclusive
+        ry1, ry2 = int(rows[0]), int(rows[-1]) + 1
         cx1, cx2 = int(cols[0]), int(cols[-1]) + 1
 
-        # --- Step 4: expand outward to capture feathered soft edges ----------
-        # Scan within the lateral extent of known content (±tolerance) so we
-        # aren't dragged out by distant stray pixels on unrelated rows/columns.
-        tol = 30  # lateral tolerance in px
-
+        # --- Step 4: expand outward to capture soft / anti-aliased edges -----
+        tol = 30
         scan_l = max(0, cx1 - tol)
         scan_r = min(w, cx2 + tol)
         lim_up = max(0, ry1 - expand_limit)
         lim_dn = min(h, ry2 + expand_limit)
 
-        while ry1 > lim_up and int(alpha[ry1 - 1, scan_l:scan_r].max()) > soft_threshold:
+        while ry1 > lim_up and float(signal[ry1 - 1, scan_l:scan_r].max()) > eff_soft:
             ry1 -= 1
-        while ry2 < lim_dn and int(alpha[ry2, scan_l:scan_r].max()) > soft_threshold:
+        while ry2 < lim_dn and float(signal[ry2, scan_l:scan_r].max()) > eff_soft:
             ry2 += 1
 
         scan_t = max(0, ry1 - tol)
@@ -200,9 +220,9 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
         lim_lt = max(0, cx1 - expand_limit)
         lim_rt = min(w, cx2 + expand_limit)
 
-        while cx1 > lim_lt and int(alpha[scan_t:scan_b, cx1 - 1].max()) > soft_threshold:
+        while cx1 > lim_lt and float(signal[scan_t:scan_b, cx1 - 1].max()) > eff_soft:
             cx1 -= 1
-        while cx2 < lim_rt and int(alpha[scan_t:scan_b, cx2].max()) > soft_threshold:
+        while cx2 < lim_rt and float(signal[scan_t:scan_b, cx2].max()) > eff_soft:
             cx2 += 1
 
         # --- Step 5: safety margin ------------------------------------------
@@ -211,6 +231,7 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
             max(0, ry1 - margin),
             min(w, cx2 + margin),
             min(h, ry2 + margin),
+            mode_label,   # extra field: method used (for status bar)
         )
 
     # ── CropView ──────────────────────────────────────────────────────────────
@@ -724,51 +745,42 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
             self._lbl_zoom.setText(f"  {pct}%")
 
         def _do_autocrop(self):
-            # Require alpha channel
-            if self._pil.mode not in ("RGBA", "LA", "PA") and "transparency" not in self._pil.info:
-                QMessageBox.information(
-                    self, "dotimg — Auto-crop",
-                    "Auto-crop works on images with a transparent background.\n"
-                    "This image has no alpha channel."
-                )
-                return
-
             self.statusBar().showMessage("Computing auto-crop…")
             QApplication.instance().processEvents()
 
             try:
-                bbox = _smart_crop_bbox(self._pil)
+                result = _smart_crop_bbox(self._pil)
             except Exception as e:
                 QMessageBox.warning(self, "dotimg — Auto-crop", f"Auto-crop failed:\n{e}")
                 self.statusBar().showMessage("Auto-crop failed", 4000)
                 return
 
-            if bbox is None:
+            if result is None:
                 QMessageBox.information(
                     self, "dotimg — Auto-crop",
-                    "No significant content found — is the image fully transparent?"
+                    "No significant content found.\n"
+                    "(Fully transparent, or image is a uniform solid color?)"
                 )
                 self.statusBar().showMessage("Auto-crop: nothing found", 4000)
                 return
 
-            x1, y1, x2, y2 = bbox
+            x1, y1, x2, y2, method = result
             iw, ih = self._pil.size
-            # Skip if result is essentially the full image (nothing to trim)
-            is_full = (x1 == 0 and y1 == 0 and x2 == iw and y2 == ih)
             rect = QRect(x1, y1, x2 - x1, y2 - y1)
             self._view.set_selection(rect)
 
+            is_full = (x1 == 0 and y1 == 0 and x2 == iw and y2 == ih)
             if is_full:
                 self.statusBar().showMessage(
-                    "Auto-crop: image already tightly cropped — selection set to full bounds", 5000
+                    f"Auto-crop ({method}): already tight — selection set to full bounds", 5000
                 )
             else:
                 saved_w = iw - (x2 - x1)
                 saved_h = ih - (y2 - y1)
                 self.statusBar().showMessage(
-                    f"Auto-crop: {x2-x1} × {y2-y1} px  "
-                    f"(trimming {saved_w} px wide, {saved_h} px tall of dead space)"
-                    f"  —  adjust if needed, then save"
+                    f"Auto-crop ({method}): {x2-x1} × {y2-y1} px  "
+                    f"· removing {saved_w}w × {saved_h}h px of dead space  "
+                    f"· adjust if needed, then save"
                 )
 
         def _get_cropped(self) -> "PILImage.Image | None":
