@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+"""
+dotimg — CLI image manipulation tool with GUI
+
+Commands:
+  dotimg crop <image>                  Crop image (Enter to save in-place)
+  dotimg crop <image> --copy           Default save action is "save copy"
+  dotimg crop <image> -o <path>        Save to a specific output path
+
+Keyboard shortcuts (crop window):
+  Drag              Draw crop selection
+  Enter / Ctrl+S    Save (overwrite original)
+  Ctrl+Shift+S      Save as copy  (_cropped suffix)
+  Ctrl+Shift+A      Save as…  (choose path)
+  Ctrl+Shift+C      Copy selection to clipboard
+  R                 Reset / clear selection
+  Escape / Ctrl+Q   Quit without saving
+"""
+
+import sys
+import os
+import argparse
+from pathlib import Path
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="dotimg",
+        description="Minimal image manipulation tool with GUI.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  dotimg crop photo.jpg\n"
+            "  dotimg crop photo.jpg --copy\n"
+            "  dotimg crop photo.jpg -o out.png"
+        ),
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+
+    crop_p = sub.add_parser("crop", help="Crop an image interactively")
+    crop_p.add_argument("image", metavar="IMAGE", help="Image file to crop")
+    crop_p.add_argument(
+        "-o", "--output", metavar="PATH",
+        help="Output path (overrides GUI default)",
+    )
+    crop_p.add_argument(
+        "--copy", action="store_true",
+        help='Default save action is "save copy" instead of overwrite',
+    )
+
+    args = parser.parse_args()
+    if args.cmd == "crop":
+        _run_crop(args.image, args.output, args.copy)
+
+
+def _check_deps():
+    missing = []
+    try:
+        import PyQt6.QtWidgets  # noqa: F401
+    except ImportError:
+        missing.append(
+            "PyQt6\n"
+            "    Arch:  sudo pacman -S python-pyqt6\n"
+            "    pip:   pip install PyQt6"
+        )
+    try:
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        missing.append(
+            "Pillow\n"
+            "    Arch:  sudo pacman -S python-pillow\n"
+            "    pip:   pip install Pillow"
+        )
+    if missing:
+        print("dotimg: missing dependencies:\n", file=sys.stderr)
+        for m in missing:
+            print(f"  {m}\n", file=sys.stderr)
+        sys.exit(1)
+
+
+def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
+    _check_deps()
+
+    from PyQt6.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QLabel, QStatusBar,
+        QMessageBox, QFileDialog, QSizePolicy,
+    )
+    from PyQt6.QtCore import Qt, QRect, QPoint, pyqtSignal
+    from PyQt6.QtGui import (
+        QPixmap, QPainter, QPen, QColor, QBrush, QCursor,
+        QImage, QKeySequence, QAction,
+    )
+    from PIL import Image as PILImage
+
+    HANDLE_SIZE = 8
+    HANDLE_HALF = HANDLE_SIZE // 2
+    OVERLAY_ALPHA = 150
+
+    class CropView(QWidget):
+        """Image canvas with interactive crop selection."""
+
+        selection_changed = pyqtSignal(QRect)
+
+        def __init__(self, pixmap: QPixmap, img_w: int, img_h: int, parent=None):
+            super().__init__(parent)
+            self.orig_pixmap = pixmap
+            self.img_w = img_w
+            self.img_h = img_h
+
+            self._scaled_px: QPixmap | None = None
+            self._scale = 1.0
+            self._offset = QPoint(0, 0)
+
+            self.sel = QRect()
+
+            self._drag: str | None = None
+            self._drag_anchor = QPoint()
+            self._drag_orig_sel = QRect()
+
+            self.setMouseTracking(True)
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            self.setMinimumSize(200, 200)
+
+        def _update_layout(self):
+            if not self.img_w or not self.img_h:
+                return
+            w, h = self.width(), self.height()
+            scale = min(w / self.img_w, h / self.img_h)
+            self._scale = scale
+            sw = int(self.img_w * scale)
+            sh = int(self.img_h * scale)
+            self._offset = QPoint((w - sw) // 2, (h - sh) // 2)
+            self._scaled_px = self.orig_pixmap.scaled(
+                sw, sh,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+
+        def _s2i(self, pt: QPoint) -> QPoint:
+            x = int((pt.x() - self._offset.x()) / self._scale)
+            y = int((pt.y() - self._offset.y()) / self._scale)
+            return QPoint(max(0, min(x, self.img_w)), max(0, min(y, self.img_h)))
+
+        def _i2s(self, r: QRect) -> QRect:
+            x = int(r.x() * self._scale) + self._offset.x()
+            y = int(r.y() * self._scale) + self._offset.y()
+            w = int(r.width() * self._scale)
+            h = int(r.height() * self._scale)
+            return QRect(x, y, w, h)
+
+        _HANDLE_CURSORS = {
+            "nw": Qt.CursorShape.SizeFDiagCursor,
+            "ne": Qt.CursorShape.SizeBDiagCursor,
+            "sw": Qt.CursorShape.SizeBDiagCursor,
+            "se": Qt.CursorShape.SizeFDiagCursor,
+            "n":  Qt.CursorShape.SizeVerCursor,
+            "s":  Qt.CursorShape.SizeVerCursor,
+            "e":  Qt.CursorShape.SizeHorCursor,
+            "w":  Qt.CursorShape.SizeHorCursor,
+        }
+
+        def _handle_rects(self, sr: QRect) -> dict[str, QRect]:
+            sl, st = sr.x(), sr.y()
+            sr_r, sr_b = sl + sr.width(), st + sr.height()
+            cx, cy = sl + sr.width() // 2, st + sr.height() // 2
+            pts = {
+                "nw": (sl, st),    "n": (cx, st),   "ne": (sr_r, st),
+                "e":  (sr_r, cy),
+                "se": (sr_r, sr_b), "s": (cx, sr_b), "sw": (sl, sr_b),
+                "w":  (sl, cy),
+            }
+            return {
+                name: QRect(x - HANDLE_HALF, y - HANDLE_HALF, HANDLE_SIZE, HANDLE_SIZE)
+                for name, (x, y) in pts.items()
+            }
+
+        def _hit_handle(self, pos: QPoint) -> str | None:
+            if self.sel.isNull():
+                return None
+            for name, rect in self._handle_rects(self._i2s(self.sel)).items():
+                if rect.contains(pos):
+                    return name
+            return None
+
+        def _in_sel(self, pos: QPoint) -> bool:
+            return not self.sel.isNull() and self._i2s(self.sel).contains(pos)
+
+        def paintEvent(self, _event):
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            p.fillRect(self.rect(), QColor(28, 28, 28))
+
+            if self._scaled_px:
+                p.drawPixmap(self._offset, self._scaled_px)
+
+            if not self.sel.isNull() and self._scaled_px:
+                sr = self._i2s(self.sel)
+                ir = QRect(
+                    self._offset.x(), self._offset.y(),
+                    self._scaled_px.width(), self._scaled_px.height(),
+                )
+                ov = QColor(0, 0, 0, OVERLAY_ALPHA)
+                sl, st = sr.x(), sr.y()
+                sr_w, sr_h = sr.width(), sr.height()
+                sr_r, sr_b = sl + sr_w, st + sr_h
+                ir_r, ir_b = ir.x() + ir.width(), ir.y() + ir.height()
+
+                p.fillRect(ir.x(), ir.y(), ir.width(), max(0, st - ir.y()), ov)
+                p.fillRect(ir.x(), sr_b,  ir.width(), max(0, ir_b - sr_b), ov)
+                p.fillRect(ir.x(), st, max(0, sl - ir.x()), sr_h, ov)
+                p.fillRect(sr_r,   st, max(0, ir_r - sr_r), sr_h, ov)
+
+                p.setPen(QPen(QColor(255, 255, 255, 220), 1))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRect(sr)
+
+                p.setPen(QPen(QColor(255, 255, 255, 70), 1, Qt.PenStyle.DashLine))
+                for i in (1, 2):
+                    gx = sl + sr_w * i // 3
+                    gy = st + sr_h * i // 3
+                    p.drawLine(gx, st, gx, sr_b)
+                    p.drawLine(sl, gy, sr_r, gy)
+
+                p.setPen(QPen(QColor(60, 60, 60), 1))
+                p.setBrush(QBrush(QColor(255, 255, 255)))
+                for hr in self._handle_rects(sr).values():
+                    p.drawRect(hr)
+
+            p.end()
+
+        def resizeEvent(self, _event):
+            self._update_layout()
+            self.update()
+
+        def mousePressEvent(self, event):
+            if event.button() != Qt.MouseButton.LeftButton:
+                return
+            pos = event.pos()
+            handle = self._hit_handle(pos)
+            if handle:
+                self._drag = handle
+                self._drag_anchor = pos
+                self._drag_orig_sel = QRect(self.sel)
+            elif self._in_sel(pos):
+                self._drag = "move"
+                self._drag_anchor = pos
+                self._drag_orig_sel = QRect(self.sel)
+            else:
+                self._drag = "create"
+                self._drag_anchor = self._s2i(pos)
+                self.sel = QRect()
+
+        def mouseMoveEvent(self, event):
+            pos = event.pos()
+
+            if self._drag == "create":
+                ip = self._s2i(pos)
+                ax, ay = self._drag_anchor.x(), self._drag_anchor.y()
+                ix, iy = ip.x(), ip.y()
+                self.sel = QRect(min(ax, ix), min(ay, iy), abs(ix - ax), abs(iy - ay))
+                self.selection_changed.emit(self.sel)
+                self.update()
+                return
+
+            if self._drag == "move":
+                ds = pos - self._drag_anchor
+                dx = int(ds.x() / self._scale)
+                dy = int(ds.y() / self._scale)
+                orig = self._drag_orig_sel
+                nx = max(0, min(orig.x() + dx, self.img_w - orig.width()))
+                ny = max(0, min(orig.y() + dy, self.img_h - orig.height()))
+                self.sel = QRect(nx, ny, orig.width(), orig.height())
+                self.selection_changed.emit(self.sel)
+                self.update()
+                return
+
+            if self._drag in self._HANDLE_CURSORS:
+                ip = self._s2i(pos)
+                orig = self._drag_orig_sel
+                l, t = orig.x(), orig.y()
+                r, b = l + orig.width(), t + orig.height()
+                ix = max(0, min(ip.x(), self.img_w))
+                iy = max(0, min(ip.y(), self.img_h))
+                if "n" in self._drag: t = min(iy, b - 1)
+                if "s" in self._drag: b = max(iy, t + 1)
+                if "w" in self._drag: l = min(ix, r - 1)
+                if "e" in self._drag: r = max(ix, l + 1)
+                self.sel = QRect(l, t, r - l, b - t)
+                self.selection_changed.emit(self.sel)
+                self.update()
+                return
+
+            handle = self._hit_handle(pos)
+            if handle:
+                self.setCursor(QCursor(self._HANDLE_CURSORS[handle]))
+            elif self._in_sel(pos):
+                self.setCursor(QCursor(Qt.CursorShape.SizeAllCursor))
+            else:
+                self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
+
+        def mouseReleaseEvent(self, event):
+            if event.button() == Qt.MouseButton.LeftButton:
+                if not self.sel.isNull() and (self.sel.width() < 2 or self.sel.height() < 2):
+                    self.sel = QRect()
+                    self.selection_changed.emit(self.sel)
+                    self.update()
+                self._drag = None
+
+        def reset_selection(self):
+            self.sel = QRect()
+            self.selection_changed.emit(self.sel)
+            self.update()
+
+        def crop_rect(self) -> QRect | None:
+            if self.sel.isNull() or self.sel.width() < 1 or self.sel.height() < 1:
+                return None
+            return QRect(self.sel)
+
+    class CropWindow(QMainWindow):
+
+        def __init__(self, image_path: Path, output_path: Path | None, copy_default: bool):
+            super().__init__()
+            self.image_path = image_path
+            self.output_path = output_path
+            self.copy_default = copy_default
+
+            self.setWindowTitle(f"dotimg  —  crop  —  {image_path.name}")
+            self.resize(960, 680)
+
+            try:
+                pil_img = PILImage.open(image_path)
+                if pil_img.mode not in ("RGB", "RGBA"):
+                    pil_img = pil_img.convert("RGBA" if "A" in pil_img.getbands() else "RGB")
+            except Exception as e:
+                QMessageBox.critical(None, "dotimg", f"Cannot open image:\n{e}")
+                sys.exit(1)
+
+            self._pil = pil_img
+            iw, ih = pil_img.size
+
+            self._view = CropView(self._pil_to_pixmap(pil_img), iw, ih)
+            self._view.selection_changed.connect(self._on_sel_changed)
+            self.setCentralWidget(self._view)
+
+            sb = QStatusBar()
+            self.setStatusBar(sb)
+            self._lbl_img = QLabel(f"  {iw} × {ih} px  ")
+            self._lbl_sel = QLabel("No selection  ")
+            sb.addWidget(self._lbl_img)
+            sb.addPermanentWidget(self._lbl_sel)
+            sb.showMessage("Drag to select  •  Enter = save  •  R = reset  •  Esc = quit")
+
+            self._build_menu()
+
+        @staticmethod
+        def _pil_to_pixmap(img: PILImage.Image) -> QPixmap:
+            if img.mode == "RGBA":
+                data = img.tobytes("raw", "RGBA")
+                qimg = QImage(data, img.width, img.height, QImage.Format.Format_RGBA8888)
+            else:
+                rgb = img.convert("RGB")
+                data = rgb.tobytes("raw", "RGB")
+                qimg = QImage(data, img.width, img.height, QImage.Format.Format_RGB888)
+            return QPixmap.fromImage(qimg)
+
+        def _build_menu(self):
+            mb = self.menuBar()
+
+            fm = mb.addMenu("&File")
+
+            a = QAction("&Save  (overwrite original)", self)
+            a.setShortcut(QKeySequence("Ctrl+S"))
+            a.setStatusTip("Crop and overwrite the original file")
+            a.triggered.connect(self._do_save_overwrite)
+            fm.addAction(a)
+
+            a = QAction("Save &Copy", self)
+            a.setShortcut(QKeySequence("Ctrl+Shift+S"))
+            a.setStatusTip("Crop and save as <name>_cropped.<ext>")
+            a.triggered.connect(self._do_save_copy)
+            fm.addAction(a)
+
+            a = QAction("Save &As…", self)
+            a.setShortcut(QKeySequence("Ctrl+Shift+A"))
+            a.setStatusTip("Crop and save to a custom path")
+            a.triggered.connect(self._do_save_as)
+            fm.addAction(a)
+
+            fm.addSeparator()
+
+            a = QAction("Copy to &Clipboard", self)
+            a.setShortcut(QKeySequence("Ctrl+Shift+C"))
+            a.setStatusTip("Copy cropped selection to clipboard")
+            a.triggered.connect(self._do_copy_clipboard)
+            fm.addAction(a)
+
+            fm.addSeparator()
+
+            a = QAction("&Quit without saving", self)
+            a.setShortcut(QKeySequence("Ctrl+Q"))
+            a.triggered.connect(self.close)
+            fm.addAction(a)
+
+            em = mb.addMenu("&Edit")
+
+            a = QAction("&Reset Selection", self)
+            a.setShortcut(QKeySequence("R"))
+            a.triggered.connect(self._view.reset_selection)
+            em.addAction(a)
+
+        def _on_sel_changed(self, r: QRect):
+            if r.isNull() or r.width() == 0 or r.height() == 0:
+                self._lbl_sel.setText("No selection  ")
+            else:
+                self._lbl_sel.setText(f"{r.width()} × {r.height()} px  ")
+
+        def _get_cropped(self) -> "PILImage.Image | None":
+            rect = self._view.crop_rect()
+            if rect is None:
+                QMessageBox.warning(self, "dotimg", "Draw a crop region first.")
+                return None
+            iw, ih = self._pil.size
+            x1 = max(0, rect.x())
+            y1 = max(0, rect.y())
+            x2 = min(iw, rect.x() + rect.width())
+            y2 = min(ih, rect.y() + rect.height())
+            return self._pil.crop((x1, y1, x2, y2))
+
+        def _copy_path(self) -> Path:
+            stem, suffix = self.image_path.stem, self.image_path.suffix
+            base = self.image_path.parent
+            candidate = base / f"{stem}_cropped{suffix}"
+            n = 1
+            while candidate.exists():
+                candidate = base / f"{stem}_cropped_{n}{suffix}"
+                n += 1
+            return candidate
+
+        def _write(self, img: "PILImage.Image", dest: Path) -> bool:
+            try:
+                out = img
+                kw: dict = {}
+                if dest.suffix.lower() in (".jpg", ".jpeg"):
+                    if out.mode == "RGBA":
+                        out = out.convert("RGB")
+                    kw["quality"] = 95
+                    kw["subsampling"] = 0
+                out.save(dest, **kw)
+                return True
+            except Exception as e:
+                QMessageBox.critical(self, "dotimg", f"Could not save:\n{e}")
+                return False
+
+        def _do_save_overwrite(self):
+            img = self._get_cropped()
+            if img is None:
+                return
+            dest = self.output_path or self.image_path
+            if self._write(img, dest):
+                self.statusBar().showMessage(f"Saved: {dest}", 4000)
+                QApplication.instance().processEvents()
+                self.close()
+
+        def _do_save_copy(self):
+            img = self._get_cropped()
+            if img is None:
+                return
+            dest = self.output_path or self._copy_path()
+            if self._write(img, dest):
+                self.statusBar().showMessage(f"Saved copy: {dest}", 4000)
+                QApplication.instance().processEvents()
+                self.close()
+
+        def _do_save_as(self):
+            img = self._get_cropped()
+            if img is None:
+                return
+            suffix = self.image_path.suffix.lower()
+            _filt = {
+                ".jpg":  "JPEG (*.jpg *.jpeg)",
+                ".jpeg": "JPEG (*.jpg *.jpeg)",
+                ".png":  "PNG (*.png)",
+                ".webp": "WebP (*.webp)",
+                ".bmp":  "BMP (*.bmp)",
+                ".tiff": "TIFF (*.tiff *.tif)",
+                ".tif":  "TIFF (*.tiff *.tif)",
+            }
+            filt = _filt.get(suffix, "Images (*.jpg *.jpeg *.png *.webp *.bmp)") + ";;All Files (*)"
+            dest, _ = QFileDialog.getSaveFileName(
+                self, "Save Cropped Image", str(self._copy_path()), filt
+            )
+            if dest and self._write(img, Path(dest)):
+                self.statusBar().showMessage(f"Saved: {dest}", 4000)
+                QApplication.instance().processEvents()
+                self.close()
+
+        def _do_copy_clipboard(self):
+            img = self._get_cropped()
+            if img is None:
+                return
+            QApplication.instance().clipboard().setPixmap(self._pil_to_pixmap(img))
+            self.statusBar().showMessage("Copied to clipboard", 3000)
+
+        def keyPressEvent(self, event):
+            k = event.key()
+            if k in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                if self.copy_default:
+                    self._do_save_copy()
+                else:
+                    self._do_save_overwrite()
+            elif k == Qt.Key.Key_Escape:
+                self.close()
+            else:
+                super().keyPressEvent(event)
+
+    image_path = Path(image_str).expanduser().resolve()
+    if not image_path.exists():
+        sys.exit(f"dotimg: file not found: {image_path}")
+
+    output_path = Path(output_str).expanduser().resolve() if output_str else None
+
+    if "WAYLAND_DISPLAY" in os.environ:
+        os.environ.setdefault("QT_QPA_PLATFORM", "wayland")
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("dotimg")
+
+    window = CropWindow(image_path, output_path, copy_default)
+    window.show()
+    # Run the Qt event loop
+    _loop = getattr(app, 'exec')
+    sys.exit(_loop())
+
+
+if __name__ == "__main__":
+    main()
