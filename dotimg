@@ -8,13 +8,24 @@ Commands:
   dotimg crop <image> -o <path>        Save to a specific output path
 
 Keyboard shortcuts (crop window):
-  Drag              Draw crop selection
-  Enter / Ctrl+S    Save (overwrite original)
-  Ctrl+Shift+S      Save as copy  (_cropped suffix)
-  Ctrl+Shift+A      Save as…  (choose path)
-  Ctrl+Shift+C      Copy selection to clipboard
-  R                 Reset / clear selection
-  Escape / Ctrl+Q   Quit without saving
+  Drag                  Draw crop selection
+  Drag inside sel       Move selection
+  Corner/edge handles   Resize selection
+  Enter / Ctrl+S        Save (overwrite original)
+  Ctrl+Shift+S          Save as copy (_cropped suffix)
+  Ctrl+Shift+A          Save as… (choose path)
+  Ctrl+Shift+C          Copy selection to clipboard
+  R                     Reset / clear selection
+  Escape / Ctrl+Q       Quit without saving
+
+Zoom / pan:
+  Ctrl+Scroll           Zoom in/out at cursor
+  Scroll (zoomed in)    Pan
+  Middle mouse drag     Pan
+  Ctrl+= / Ctrl++       Zoom in
+  Ctrl+-                Zoom out
+  Ctrl+0                Reset zoom (fit to window)
+  Pinch gesture         Zoom (touchpad)
 """
 
 import sys
@@ -39,14 +50,10 @@ def main():
 
     crop_p = sub.add_parser("crop", help="Crop an image interactively")
     crop_p.add_argument("image", metavar="IMAGE", help="Image file to crop")
-    crop_p.add_argument(
-        "-o", "--output", metavar="PATH",
-        help="Output path (overrides GUI default)",
-    )
-    crop_p.add_argument(
-        "--copy", action="store_true",
-        help='Default save action is "save copy" instead of overwrite',
-    )
+    crop_p.add_argument("-o", "--output", metavar="PATH",
+                        help="Output path (overrides GUI default)")
+    crop_p.add_argument("--copy", action="store_true",
+                        help='Default save action is "save copy" instead of overwrite')
 
     args = parser.parse_args()
     if args.cmd == "crop":
@@ -85,7 +92,7 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
         QApplication, QMainWindow, QWidget, QLabel, QStatusBar,
         QMessageBox, QFileDialog, QSizePolicy,
     )
-    from PyQt6.QtCore import Qt, QRect, QPoint, pyqtSignal
+    from PyQt6.QtCore import Qt, QRect, QPoint, QPointF, QEvent, pyqtSignal
     from PyQt6.QtGui import (
         QPixmap, QPainter, QPen, QColor, QBrush, QCursor,
         QImage, QKeySequence, QAction,
@@ -95,11 +102,17 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
     HANDLE_SIZE = 8
     HANDLE_HALF = HANDLE_SIZE // 2
     OVERLAY_ALPHA = 150
+    ZOOM_STEP = 1.25
+    ZOOM_MIN = 0.5
+    ZOOM_MAX = 12.0
+
+    # ── CropView ──────────────────────────────────────────────────────────────
 
     class CropView(QWidget):
-        """Image canvas with interactive crop selection."""
+        """Image canvas with interactive crop selection and zoom/pan."""
 
         selection_changed = pyqtSignal(QRect)
+        zoom_changed = pyqtSignal(float)
 
         def __init__(self, pixmap: QPixmap, img_w: int, img_h: int, parent=None):
             super().__init__(parent)
@@ -108,8 +121,11 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
             self.img_h = img_h
 
             self._scaled_px: QPixmap | None = None
-            self._scale = 1.0
+            self._base_scale = 1.0   # scale to fit window
+            self._zoom = 1.0         # user zoom multiplier
+            self._eff_scale = 1.0    # _base_scale * _zoom
             self._offset = QPoint(0, 0)
+            self._pan = QPointF(0.0, 0.0)  # pan delta from centered position
 
             self.sel = QRect()
 
@@ -117,19 +133,51 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
             self._drag_anchor = QPoint()
             self._drag_orig_sel = QRect()
 
+            self._mid_drag = False
+            self._mid_drag_start = QPoint()
+            self._mid_drag_pan_start = QPointF()
+
             self.setMouseTracking(True)
             self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             self.setMinimumSize(200, 200)
+            self.setAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
+            try:
+                self.grabGesture(Qt.GestureType.PinchGesture)
+            except Exception:
+                pass
+
+        # ── layout / scale helpers ────────────────────────────────────────────
 
         def _update_layout(self):
             if not self.img_w or not self.img_h:
                 return
             w, h = self.width(), self.height()
-            scale = min(w / self.img_w, h / self.img_h)
-            self._scale = scale
-            sw = int(self.img_w * scale)
-            sh = int(self.img_h * scale)
-            self._offset = QPoint((w - sw) // 2, (h - sh) // 2)
+            self._base_scale = min(w / self.img_w, h / self.img_h)
+            self._eff_scale = self._base_scale * self._zoom
+
+            sw = int(self.img_w * self._eff_scale)
+            sh = int(self.img_h * self._eff_scale)
+
+            # Centered base offset
+            cx = (w - sw) // 2
+            cy = (h - sh) // 2
+
+            # Apply and clamp pan
+            ox = cx + int(self._pan.x())
+            oy = cy + int(self._pan.y())
+            if sw <= w:
+                ox = cx
+            else:
+                ox = max(w - sw, min(0, ox))
+            if sh <= h:
+                oy = cy
+            else:
+                oy = max(h - sh, min(0, oy))
+
+            # Sync _pan to actual clamped offset
+            self._pan = QPointF(ox - cx, oy - cy)
+            self._offset = QPoint(ox, oy)
+
             self._scaled_px = self.orig_pixmap.scaled(
                 sw, sh,
                 Qt.AspectRatioMode.KeepAspectRatio,
@@ -137,16 +185,61 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
             )
 
         def _s2i(self, pt: QPoint) -> QPoint:
-            x = int((pt.x() - self._offset.x()) / self._scale)
-            y = int((pt.y() - self._offset.y()) / self._scale)
+            """Screen → image coordinates, clamped."""
+            x = int((pt.x() - self._offset.x()) / self._eff_scale)
+            y = int((pt.y() - self._offset.y()) / self._eff_scale)
             return QPoint(max(0, min(x, self.img_w)), max(0, min(y, self.img_h)))
 
         def _i2s(self, r: QRect) -> QRect:
-            x = int(r.x() * self._scale) + self._offset.x()
-            y = int(r.y() * self._scale) + self._offset.y()
-            w = int(r.width() * self._scale)
-            h = int(r.height() * self._scale)
+            """Image rect → screen rect."""
+            x = int(r.x() * self._eff_scale) + self._offset.x()
+            y = int(r.y() * self._eff_scale) + self._offset.y()
+            w = int(r.width() * self._eff_scale)
+            h = int(r.height() * self._eff_scale)
             return QRect(x, y, w, h)
+
+        # ── zoom helpers ──────────────────────────────────────────────────────
+
+        def _zoom_at(self, screen_pt: QPoint, factor: float):
+            """Zoom by factor, keeping screen_pt over the same image point."""
+            if not self._base_scale:
+                return
+            old_eff = self._eff_scale
+            new_zoom = max(ZOOM_MIN, min(ZOOM_MAX, self._zoom * factor))
+            new_eff = self._base_scale * new_zoom
+
+            # Image point under cursor
+            img_x = (screen_pt.x() - self._offset.x()) / old_eff
+            img_y = (screen_pt.y() - self._offset.y()) / old_eff
+
+            sw = int(self.img_w * new_eff)
+            sh = int(self.img_h * new_eff)
+            cx = (self.width() - sw) // 2
+            cy = (self.height() - sh) // 2
+
+            new_ox = screen_pt.x() - img_x * new_eff
+            new_oy = screen_pt.y() - img_y * new_eff
+
+            self._zoom = new_zoom
+            self._pan = QPointF(new_ox - cx, new_oy - cy)
+            self._update_layout()
+            self.zoom_changed.emit(self._zoom)
+            self.update()
+
+        def zoom_in(self):
+            self._zoom_at(QPoint(self.width() // 2, self.height() // 2), ZOOM_STEP)
+
+        def zoom_out(self):
+            self._zoom_at(QPoint(self.width() // 2, self.height() // 2), 1.0 / ZOOM_STEP)
+
+        def reset_zoom(self):
+            self._zoom = 1.0
+            self._pan = QPointF(0.0, 0.0)
+            self._update_layout()
+            self.zoom_changed.emit(self._zoom)
+            self.update()
+
+        # ── handle helpers ────────────────────────────────────────────────────
 
         _HANDLE_CURSORS = {
             "nw": Qt.CursorShape.SizeFDiagCursor,
@@ -164,7 +257,7 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
             sr_r, sr_b = sl + sr.width(), st + sr.height()
             cx, cy = sl + sr.width() // 2, st + sr.height() // 2
             pts = {
-                "nw": (sl, st),    "n": (cx, st),   "ne": (sr_r, st),
+                "nw": (sl, st),    "n": (cx, st),    "ne": (sr_r, st),
                 "e":  (sr_r, cy),
                 "se": (sr_r, sr_b), "s": (cx, sr_b), "sw": (sl, sr_b),
                 "w":  (sl, cy),
@@ -184,6 +277,8 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
 
         def _in_sel(self, pos: QPoint) -> bool:
             return not self.sel.isNull() and self._i2s(self.sel).contains(pos)
+
+        # ── painting ──────────────────────────────────────────────────────────
 
         def paintEvent(self, _event):
             p = QPainter(self)
@@ -232,10 +327,60 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
             self._update_layout()
             self.update()
 
+        # ── events ────────────────────────────────────────────────────────────
+
+        def event(self, event):
+            if event.type() == QEvent.Type.Gesture:
+                return self._handle_gesture(event)
+            return super().event(event)
+
+        def _handle_gesture(self, event):
+            try:
+                pinch = event.gesture(Qt.GestureType.PinchGesture)
+                if pinch:
+                    factor = pinch.scaleFactor()
+                    if factor and abs(factor - 1.0) > 0.001:
+                        center = pinch.centerPoint().toPoint()
+                        self._zoom_at(center, factor)
+            except Exception:
+                pass
+            return True
+
+        def wheelEvent(self, event):
+            mods = event.modifiers()
+            delta = event.angleDelta()
+
+            if mods & Qt.KeyboardModifier.ControlModifier:
+                yd = delta.y()
+                if yd == 0:
+                    return
+                factor = ZOOM_STEP if yd > 0 else 1.0 / ZOOM_STEP
+                self._zoom_at(event.pos(), factor)
+                event.accept()
+            else:
+                # Plain scroll: pan when zoomed in
+                sw = int(self.img_w * self._eff_scale)
+                sh = int(self.img_h * self._eff_scale)
+                if sw <= self.width() and sh <= self.height():
+                    return
+                self._pan = QPointF(
+                    self._pan.x() - delta.x() * 0.5,
+                    self._pan.y() - delta.y() * 0.5,
+                )
+                self._update_layout()
+                self.update()
+                event.accept()
+
         def mousePressEvent(self, event):
+            pos = event.pos()
+            if event.button() == Qt.MouseButton.MiddleButton:
+                self._mid_drag = True
+                self._mid_drag_start = pos
+                self._mid_drag_pan_start = QPointF(self._pan)
+                self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
+                return
             if event.button() != Qt.MouseButton.LeftButton:
                 return
-            pos = event.pos()
             handle = self._hit_handle(pos)
             if handle:
                 self._drag = handle
@@ -253,6 +398,16 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
         def mouseMoveEvent(self, event):
             pos = event.pos()
 
+            if self._mid_drag:
+                delta = pos - self._mid_drag_start
+                self._pan = QPointF(
+                    self._mid_drag_pan_start.x() + delta.x(),
+                    self._mid_drag_pan_start.y() + delta.y(),
+                )
+                self._update_layout()
+                self.update()
+                return
+
             if self._drag == "create":
                 ip = self._s2i(pos)
                 ax, ay = self._drag_anchor.x(), self._drag_anchor.y()
@@ -264,8 +419,8 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
 
             if self._drag == "move":
                 ds = pos - self._drag_anchor
-                dx = int(ds.x() / self._scale)
-                dy = int(ds.y() / self._scale)
+                dx = int(ds.x() / self._eff_scale)
+                dy = int(ds.y() / self._eff_scale)
                 orig = self._drag_orig_sel
                 nx = max(0, min(orig.x() + dx, self.img_w - orig.width()))
                 ny = max(0, min(orig.y() + dy, self.img_h - orig.height()))
@@ -299,6 +454,10 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
                 self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
 
         def mouseReleaseEvent(self, event):
+            if event.button() == Qt.MouseButton.MiddleButton:
+                self._mid_drag = False
+                self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+                return
             if event.button() == Qt.MouseButton.LeftButton:
                 if not self.sel.isNull() and (self.sel.width() < 2 or self.sel.height() < 2):
                     self.sel = QRect()
@@ -315,6 +474,8 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
             if self.sel.isNull() or self.sel.width() < 1 or self.sel.height() < 1:
                 return None
             return QRect(self.sel)
+
+    # ── CropWindow ────────────────────────────────────────────────────────────
 
     class CropWindow(QMainWindow):
 
@@ -340,15 +501,21 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
 
             self._view = CropView(self._pil_to_pixmap(pil_img), iw, ih)
             self._view.selection_changed.connect(self._on_sel_changed)
+            self._view.zoom_changed.connect(self._on_zoom_changed)
             self.setCentralWidget(self._view)
 
+            # Status bar — permanent widgets (right side) don't overlap showMessage (left)
             sb = QStatusBar()
             self.setStatusBar(sb)
-            self._lbl_img = QLabel(f"  {iw} × {ih} px  ")
-            self._lbl_sel = QLabel("No selection  ")
-            sb.addWidget(self._lbl_img)
+            self._lbl_zoom = QLabel("  100%")
+            self._lbl_img  = QLabel(f"  {iw} × {ih} px  ")
+            self._lbl_sel  = QLabel("  No selection  ")
+            sb.addPermanentWidget(self._lbl_zoom)
+            sb.addPermanentWidget(self._lbl_img)
             sb.addPermanentWidget(self._lbl_sel)
-            sb.showMessage("Drag to select  •  Enter = save  •  R = reset  •  Esc = quit")
+            sb.showMessage(
+                "Drag to select  •  Ctrl+Scroll = zoom  •  Middle drag = pan  •  Enter = save  •  Esc = quit"
+            )
 
             self._build_menu()
 
@@ -366,6 +533,7 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
         def _build_menu(self):
             mb = self.menuBar()
 
+            # File
             fm = mb.addMenu("&File")
 
             a = QAction("&Save  (overwrite original)", self)
@@ -401,6 +569,7 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
             a.triggered.connect(self.close)
             fm.addAction(a)
 
+            # Edit
             em = mb.addMenu("&Edit")
 
             a = QAction("&Reset Selection", self)
@@ -408,11 +577,33 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
             a.triggered.connect(self._view.reset_selection)
             em.addAction(a)
 
+            # View
+            vm = mb.addMenu("&View")
+
+            a = QAction("Zoom &In", self)
+            a.setShortcut(QKeySequence("Ctrl+="))
+            a.triggered.connect(self._view.zoom_in)
+            vm.addAction(a)
+
+            a = QAction("Zoom &Out", self)
+            a.setShortcut(QKeySequence("Ctrl+-"))
+            a.triggered.connect(self._view.zoom_out)
+            vm.addAction(a)
+
+            a = QAction("&Reset Zoom", self)
+            a.setShortcut(QKeySequence("Ctrl+0"))
+            a.triggered.connect(self._view.reset_zoom)
+            vm.addAction(a)
+
         def _on_sel_changed(self, r: QRect):
             if r.isNull() or r.width() == 0 or r.height() == 0:
-                self._lbl_sel.setText("No selection  ")
+                self._lbl_sel.setText("  No selection  ")
             else:
-                self._lbl_sel.setText(f"{r.width()} × {r.height()} px  ")
+                self._lbl_sel.setText(f"  {r.width()} × {r.height()} px  ")
+
+        def _on_zoom_changed(self, zoom: float):
+            pct = int(round(zoom * 100))
+            self._lbl_zoom.setText(f"  {pct}%")
 
         def _get_cropped(self) -> "PILImage.Image | None":
             rect = self._view.crop_rect()
@@ -503,6 +694,8 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
 
         def keyPressEvent(self, event):
             k = event.key()
+            mods = event.modifiers()
+            ctrl = Qt.KeyboardModifier.ControlModifier
             if k in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                 if self.copy_default:
                     self._do_save_copy()
@@ -510,8 +703,16 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
                     self._do_save_overwrite()
             elif k == Qt.Key.Key_Escape:
                 self.close()
+            elif mods & ctrl and k in (Qt.Key.Key_Equal, Qt.Key.Key_Plus):
+                self._view.zoom_in()
+            elif mods & ctrl and k == Qt.Key.Key_Minus:
+                self._view.zoom_out()
+            elif mods & ctrl and k == Qt.Key.Key_0:
+                self._view.reset_zoom()
             else:
                 super().keyPressEvent(event)
+
+    # ── launch ────────────────────────────────────────────────────────────────
 
     image_path = Path(image_str).expanduser().resolve()
     if not image_path.exists():
@@ -527,7 +728,6 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
 
     window = CropWindow(image_path, output_path, copy_default)
     window.show()
-    # Run the Qt event loop
     _loop = getattr(app, 'exec')
     sys.exit(_loop())
 
