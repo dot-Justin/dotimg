@@ -355,7 +355,7 @@ def _run_crop(image_str: str, output_str: str | None, copy_default: bool):
                 if yd == 0:
                     return
                 factor = ZOOM_STEP if yd > 0 else 1.0 / ZOOM_STEP
-                self._zoom_at(event.pos(), factor)
+                self._zoom_at(event.position().toPoint(), factor)
                 event.accept()
             else:
                 # Plain scroll: pan when zoomed in
